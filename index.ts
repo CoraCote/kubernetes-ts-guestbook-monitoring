@@ -1,5 +1,6 @@
 import { config as loadEnv } from "dotenv";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as k8s from "@pulumi/kubernetes";
 import * as pulumi from "@pulumi/pulumi";
@@ -40,6 +41,12 @@ function envString(key: string, fallback: string): string {
 const config = new pulumi.Config();
 const isMinikube = envBool("IS_MINIKUBE", config.getBoolean("isMinikube") ?? true);
 
+/** Stable Grafana NodePort when using Minikube (Helm Release has no Pulumi child Service to read at preview time). */
+const grafanaServiceNodePort = (() => {
+    const p = Number.parseInt(envString("GRAFANA_NODE_PORT", "31302"), 10);
+    return Number.isFinite(p) && p >= 30000 && p <= 32767 ? p : 31302;
+})();
+
 const grafanaPasswordFromEnv = process.env.GRAFANA_ADMIN_PASSWORD;
 const grafanaAdminPassword = grafanaPasswordFromEnv
     ? pulumi.secret(grafanaPasswordFromEnv)
@@ -48,10 +55,71 @@ const grafanaAdminPassword = grafanaPasswordFromEnv
 const prometheusCommunityRepo = "https://prometheus-community.github.io/helm-charts";
 const kubePromStackVersion = envString("KUBE_PROM_STACK_VERSION", "61.7.2");
 const blackboxExporterVersion = envString("BLACKBOX_EXPORTER_VERSION", "8.17.0");
+/** Matches prometheus-operator ~0.75.x shipped with kube-prometheus-stack 61.7.x (see chart appVersion). */
+const prometheusOperatorCrdsVersion = envString("PROMETHEUS_OPERATOR_CRDS_VERSION", "13.0.0");
 
-const monitoringNamespace = new k8s.core.v1.Namespace("monitoring", {
-    metadata: { name: "monitoring" },
+/**
+ * Helm release name for kube-prometheus-stack (prefix for many cluster-scoped objects).
+ * Default avoids collisions with legacy Pulumi `Chart` installs that used release name `kps`.
+ */
+const kubePromHelmReleaseName = envString("KUBE_PROM_HELM_RELEASE_NAME", "gbmkps");
+
+/**
+ * Grafana subchart `fullnameOverride` (Service / ClusterRole names include this string).
+ * Default avoids collisions with legacy `guestbook-grafana-*` ClusterRoles from older revisions.
+ */
+const grafanaHelmFullname = envString("GRAFANA_HELM_FULLNAME", "gbmon-grafana");
+
+/** Resolve kubeconfig file path (explicit env / Pulumi config / KUBECONFIG / default). */
+function resolveKubeconfigPath(): string {
+    const tried: string[] = [];
+    const pushCandidate = (p: string | undefined) => {
+        if (!p) return;
+        const abs = path.resolve(p);
+        if (!tried.includes(abs)) tried.push(abs);
+    };
+    pushCandidate(process.env.KUBECONFIG_PATH?.trim());
+    pushCandidate(config.get("kubeconfigPath")?.trim());
+    const kubeEnv = process.env.KUBECONFIG?.trim();
+    if (kubeEnv) {
+        pushCandidate(kubeEnv.split(path.delimiter)[0]?.trim());
+    }
+    pushCandidate(path.join(os.homedir(), ".kube", "config"));
+    for (const p of tried) {
+        try {
+            const st = fs.statSync(p);
+            if (st.isFile() && st.size > 0) {
+                return p;
+            }
+        } catch {
+            /* continue */
+        }
+    }
+    throw new pulumi.RunError(
+        "No kubeconfig file found or file is empty. Fix one of:\n" +
+            "  • export KUBECONFIG=/path/to/kubeconfig\n" +
+            "  • add KUBECONFIG_PATH=/path/to/kubeconfig to .env\n" +
+            "  • pulumi config set kubeconfigPath /path/to/kubeconfig\n" +
+            "  • ensure ~/.kube/config exists (e.g. minikube: minikube update-context; kind: kind export kubeconfig)\n" +
+            `Tried: ${tried.join(", ") || "(none)"}`,
+    );
+}
+
+const clusterProvider = new k8s.Provider("cluster", {
+    kubeconfig: fs.readFileSync(resolveKubeconfigPath(), "utf8"),
 });
+
+function kopts(extra?: pulumi.CustomResourceOptions): pulumi.CustomResourceOptions {
+    return extra ? { ...extra, provider: clusterProvider } : { provider: clusterProvider };
+}
+
+const monitoringNamespace = new k8s.core.v1.Namespace(
+    "monitoring",
+    {
+        metadata: { name: "monitoring" },
+    },
+    kopts(),
+);
 
 // Blackbox exporter (HTTP probes against the Guestbook frontend).
 const blackboxExporter = new k8s.helm.v3.Chart(
@@ -66,19 +134,41 @@ const blackboxExporter = new k8s.helm.v3.Chart(
             serviceMonitor: { enabled: false },
         },
     },
-    { dependsOn: [monitoringNamespace] },
+    kopts({ dependsOn: [monitoringNamespace] }),
 );
 
 const blackboxAddress = "blackbox-exporter.monitoring.svc.cluster.local:9115";
 
-const kubePromStack = new k8s.helm.v3.Chart(
+// Use Helm Release (not Chart) so the Helm engine installs CRDs before CRs — fixes
+// "no matches for kind ServiceMonitor / PrometheusRule" when Pulumi Chart parallelizes YAML applies.
+const prometheusOperatorCrdsRelease = new k8s.helm.v3.Release(
+    "prometheus-operator-crds",
+    {
+        name: "prometheus-operator-crds",
+        chart: "prometheus-operator-crds",
+        version: prometheusOperatorCrdsVersion,
+        namespace: monitoringNamespace.metadata.name,
+        repositoryOpts: { repo: prometheusCommunityRepo },
+        timeout: 600,
+    },
+    kopts({ dependsOn: [monitoringNamespace] }),
+);
+
+const kpsRelease = new k8s.helm.v3.Release(
     "kps",
     {
+        name: kubePromHelmReleaseName,
         chart: "kube-prometheus-stack",
         version: kubePromStackVersion,
         namespace: monitoringNamespace.metadata.name,
-        fetchOpts: { repo: prometheusCommunityRepo },
+        repositoryOpts: { repo: prometheusCommunityRepo },
+        // CRDs come from prometheus-operator-crds release; skip any duplicate CRDs in this chart package.
+        skipCrds: true,
+        timeout: 1200,
         values: {
+            crds: {
+                enabled: false,
+            },
             prometheus: {
                 prometheusSpec: {
                     serviceMonitorSelectorNilUsesHelmValues: false,
@@ -102,12 +192,12 @@ const kubePromStack = new k8s.helm.v3.Chart(
                 },
             },
             grafana: {
-                fullnameOverride: "guestbook-grafana",
+                fullnameOverride: grafanaHelmFullname,
                 adminUser: "admin",
                 adminPassword: grafanaAdminPassword,
-                service: {
-                    type: isMinikube ? "NodePort" : "LoadBalancer",
-                },
+                service: isMinikube
+                    ? { type: "NodePort", nodePort: grafanaServiceNodePort }
+                    : { type: "LoadBalancer" },
                 sidecar: {
                     dashboards: {
                         enabled: true,
@@ -118,7 +208,7 @@ const kubePromStack = new k8s.helm.v3.Chart(
             },
         },
     },
-    { dependsOn: [monitoringNamespace, blackboxExporter] },
+    kopts({ dependsOn: [monitoringNamespace, blackboxExporter, prometheusOperatorCrdsRelease] }),
 );
 
 //
@@ -126,7 +216,9 @@ const kubePromStack = new k8s.helm.v3.Chart(
 //
 
 const redisLeaderLabels = { app: "redis-leader" };
-const redisLeaderDeployment = new k8s.apps.v1.Deployment("redis-leader", {
+const redisLeaderDeployment = new k8s.apps.v1.Deployment(
+    "redis-leader",
+    {
     spec: {
         selector: { matchLabels: redisLeaderLabels },
         template: {
@@ -143,9 +235,13 @@ const redisLeaderDeployment = new k8s.apps.v1.Deployment("redis-leader", {
             },
         },
     },
-});
+},
+    kopts(),
+);
 
-const redisLeaderService = new k8s.core.v1.Service("redis-leader", {
+const redisLeaderService = new k8s.core.v1.Service(
+    "redis-leader",
+    {
     metadata: {
         name: "redis-leader",
         labels: redisLeaderDeployment.metadata.labels,
@@ -154,10 +250,14 @@ const redisLeaderService = new k8s.core.v1.Service("redis-leader", {
         ports: [{ port: 6379, targetPort: 6379 }],
         selector: redisLeaderDeployment.spec.template.metadata.labels,
     },
-});
+},
+    kopts(),
+);
 
 const redisReplicaLabels = { app: "redis-replica" };
-const redisReplicaDeployment = new k8s.apps.v1.Deployment("redis-replica", {
+const redisReplicaDeployment = new k8s.apps.v1.Deployment(
+    "redis-replica",
+    {
     spec: {
         selector: { matchLabels: redisReplicaLabels },
         template: {
@@ -175,9 +275,13 @@ const redisReplicaDeployment = new k8s.apps.v1.Deployment("redis-replica", {
             },
         },
     },
-});
+},
+    kopts(),
+);
 
-const redisReplicaService = new k8s.core.v1.Service("redis-replica", {
+const redisReplicaService = new k8s.core.v1.Service(
+    "redis-replica",
+    {
     metadata: {
         name: "redis-replica",
         labels: redisReplicaDeployment.metadata.labels,
@@ -186,10 +290,14 @@ const redisReplicaService = new k8s.core.v1.Service("redis-replica", {
         ports: [{ port: 6379, targetPort: 6379 }],
         selector: redisReplicaDeployment.spec.template.metadata.labels,
     },
-});
+},
+    kopts(),
+);
 
 const frontendLabels = { app: "frontend" };
-const frontendDeployment = new k8s.apps.v1.Deployment("frontend", {
+const frontendDeployment = new k8s.apps.v1.Deployment(
+    "frontend",
+    {
     spec: {
         selector: { matchLabels: frontendLabels },
         replicas: 3,
@@ -208,9 +316,13 @@ const frontendDeployment = new k8s.apps.v1.Deployment("frontend", {
             },
         },
     },
-});
+},
+    kopts(),
+);
 
-const frontendService = new k8s.core.v1.Service("frontend", {
+const frontendService = new k8s.core.v1.Service(
+    "frontend",
+    {
     metadata: {
         labels: frontendDeployment.metadata.labels,
         name: "frontend",
@@ -220,7 +332,9 @@ const frontendService = new k8s.core.v1.Service("frontend", {
         ports: [{ port: 80 }],
         selector: frontendDeployment.spec.template.metadata.labels,
     },
-});
+},
+    kopts(),
+);
 
 //
 // Redis exporters (Prometheus metrics for Redis leader + replica).
@@ -248,10 +362,12 @@ const redisLeaderExporterDeployment = new k8s.apps.v1.Deployment(
             },
         },
     },
-    { dependsOn: [redisLeaderService] },
+    kopts({ dependsOn: [redisLeaderService] }),
 );
 
-const redisLeaderExporterService = new k8s.core.v1.Service("redis-leader-exporter", {
+const redisLeaderExporterService = new k8s.core.v1.Service(
+    "redis-leader-exporter",
+    {
     metadata: {
         name: "redis-leader-exporter",
         labels: redisLeaderExporterLabels,
@@ -260,7 +376,9 @@ const redisLeaderExporterService = new k8s.core.v1.Service("redis-leader-exporte
         ports: [{ name: "metrics", port: 9121, targetPort: 9121 }],
         selector: redisLeaderExporterLabels,
     },
-});
+},
+    kopts(),
+);
 
 const redisReplicaExporterLabels = { app: "redis-replica-exporter" };
 const redisReplicaExporterDeployment = new k8s.apps.v1.Deployment(
@@ -284,10 +402,12 @@ const redisReplicaExporterDeployment = new k8s.apps.v1.Deployment(
             },
         },
     },
-    { dependsOn: [redisReplicaService] },
+    kopts({ dependsOn: [redisReplicaService] }),
 );
 
-const redisReplicaExporterService = new k8s.core.v1.Service("redis-replica-exporter", {
+const redisReplicaExporterService = new k8s.core.v1.Service(
+    "redis-replica-exporter",
+    {
     metadata: {
         name: "redis-replica-exporter",
         labels: redisReplicaExporterLabels,
@@ -296,9 +416,13 @@ const redisReplicaExporterService = new k8s.core.v1.Service("redis-replica-expor
         ports: [{ name: "metrics", port: 9121, targetPort: 9121 }],
         selector: redisReplicaExporterLabels,
     },
-});
+},
+    kopts(),
+);
 
-const smOpts: pulumi.CustomResourceOptions = { dependsOn: [kubePromStack, redisLeaderExporterService] };
+const smOpts: pulumi.CustomResourceOptions = kopts({
+    dependsOn: [kpsRelease, redisLeaderExporterService],
+});
 
 new k8s.apiextensions.CustomResource(
     "sm-redis-leader-exporter",
@@ -335,7 +459,7 @@ new k8s.apiextensions.CustomResource(
             },
         },
     },
-    { dependsOn: [kubePromStack, redisReplicaExporterService] },
+    kopts({ dependsOn: [kpsRelease, redisReplicaExporterService] }),
 );
 
 // Provisioned dashboard (sidecar picks up ConfigMaps in the Grafana namespace).
@@ -351,16 +475,8 @@ new k8s.core.v1.ConfigMap(
         },
         data: { "guestbook.json": dashboardJson },
     },
-    { dependsOn: [kubePromStack] },
+    kopts({ dependsOn: [kpsRelease] }),
 );
-
-const grafanaService = kubePromStack.getResource("v1/Service", "monitoring", "guestbook-grafana");
-
-const grafanaNodePort = grafanaService.spec.apply((spec) => {
-    const ports = spec?.ports ?? [];
-    const match = ports.find((p) => p.name === "http-web" || p.port === 80);
-    return match?.nodePort ?? ports[0]?.nodePort ?? 0;
-});
 
 export const frontendIp: pulumi.Output<string> = isMinikube
     ? frontendService.spec.clusterIP
@@ -371,14 +487,14 @@ export const frontendIp: pulumi.Output<string> = isMinikube
 export const grafanaAdminUser = "admin";
 export const grafanaAdminPasswordOut = grafanaAdminPassword;
 
-/** Minikube: use `minikube service guestbook-grafana -n monitoring --url` for the correct URL. */
+/** Minikube: fixed NodePort from Helm values (see GRAFANA_NODE_PORT). Cloud: resolve LB host with kubectl after deploy. */
 export const grafanaUrl = isMinikube
-    ? pulumi.interpolate`http://127.0.0.1:${grafanaNodePort} (or run: minikube service guestbook-grafana -n monitoring --url)`
-    : grafanaService.status.apply((st) => {
-          const ing = st?.loadBalancer?.ingress?.[0];
-          const host = ing?.hostname ?? ing?.ip;
-          return host ? `http://${host}` : "pending LoadBalancer hostname/IP";
-      });
+    ? pulumi.output(
+          `http://127.0.0.1:${grafanaServiceNodePort} (or run: minikube service ${grafanaHelmFullname} -n monitoring --url)`,
+      )
+    : pulumi.output(
+          `LoadBalancer: kubectl get svc ${grafanaHelmFullname} -n monitoring -o wide — open http://<EXTERNAL-IP> when ADDRESS is assigned.`,
+      );
 
 export const verifyMetricsHint =
-    "kubectl -n monitoring port-forward svc/prometheus-operated 9090:9090 (or svc/prometheus-kps-kube-prometheus-prometheus). Prometheus UI → Status → Targets: look for redis-leader-exporter, redis-replica-exporter, blackbox-frontend. PromQL: redis_connected_clients, probe_success{job=\"blackbox-frontend\"}";
+    "kubectl -n monitoring port-forward svc/prometheus-operated 9090:9090 (or kubectl get svc -n monitoring | grep -i prom). Prometheus UI → Status → Targets: look for redis-leader-exporter, redis-replica-exporter, blackbox-frontend. PromQL: redis_connected_clients, probe_success{job=\"blackbox-frontend\"}";

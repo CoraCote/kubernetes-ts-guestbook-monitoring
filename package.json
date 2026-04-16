@@ -8,7 +8,9 @@
   "scripts": {
     "build": "tsc",
     "test": "npm run build && node scripts/run-tests.mjs",
-    "verify:cluster": "bash scripts/verify-cluster.sh"
+    "verify:cluster": "bash scripts/verify-cluster.sh",
+    "diagnose:kubectl": "bash scripts/diagnose-kubectl.sh",
+    "fix:monitoring-ns": "bash scripts/reset-monitoring-namespace.sh"
   },
   "dependencies": {
     "@pulumi/kubernetes": "4.28.0",

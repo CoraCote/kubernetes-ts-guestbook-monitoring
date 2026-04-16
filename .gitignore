@@ -6,3 +6,5 @@ bin/
 .pulumi/
 *.log
 .package-lock.json
+
+minikube-linux-amd64

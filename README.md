@@ -13,6 +13,57 @@ This project extends the [Pulumi Kubernetes Guestbook](https://github.com/pulumi
 - Node.js 18+
 - `kubectl` configured for your cluster
 - Enough resources for kube-prometheus-stack (several pods in `monitoring`)
+- A **running Kubernetes cluster** and a valid **`~/.kube/config`** (see below if `kubectl` fails)
+
+## Local Kubernetes cluster (fix `localhost:8080` / connection refused)
+
+If `kubectl cluster-info` shows **`connection refused`** to **`127.0.0.1:8080`**, kubectl has **no real cluster** configured: usually **missing or empty `~/.kube/config`**, or **no current context**. This repo does not install Kubernetes for you—you must run a cluster locally or point kubeconfig at a cloud cluster.
+
+Run the project helper (prints the same guidance):
+
+```bash
+npm run diagnose:kubectl
+```
+
+### Option A — Minikube (common on Ubuntu VMs)
+
+Requires a driver ([install Minikube](https://minikube.sigs.k8s.io/docs/start/)). With Docker installed:
+
+```bash
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+sudo install minikube-linux-amd64 /usr/local/bin/minikube
+minikube start
+kubectl cluster-info
+```
+
+Use `IS_MINIKUBE=true` in `.env` (or `pulumi config set isMinikube true`) for this project’s NodePort defaults.
+
+### Option B — kind (needs [Docker](https://docs.docker.com/engine/install/ubuntu/))
+
+```bash
+# install kind from https://kind.sigs.k8s.io/docs/user/quick-start/#installation
+kind create cluster
+kubectl cluster-info
+```
+
+### Option C — MicroK8s
+
+```bash
+sudo snap install microk8s --classic
+sudo microk8s status --wait-ready
+mkdir -p ~/.kube
+sudo microk8s config > ~/.kube/config
+chmod 600 ~/.kube/config
+kubectl cluster-info
+```
+
+### After the cluster works
+
+```bash
+kubectl get nodes
+cd kubernetes-ts-guestbook-monitoring
+pulumi up
+```
 
 ## Configuration
 
@@ -32,8 +83,13 @@ The program loads [dotenv](https://github.com/motdotla/dotenv) from a **`.env`**
 | --- | --- |
 | `IS_MINIKUBE` | `true` / `1` / `yes`: Guestbook frontend stays `ClusterIP`; Grafana uses **NodePort**. `false`: frontend **LoadBalancer** where supported; Grafana **LoadBalancer**. |
 | `GRAFANA_ADMIN_PASSWORD` | Grafana `admin` password (stored as a Pulumi secret in state). Prefer a strong value in production. |
+| `GRAFANA_NODE_PORT` | Minikube only: fixed **NodePort** for Grafana (default **31302**). Used so `pulumi preview` does not read the Service from the API (Helm `Release` does not expose it as a Pulumi child resource). |
+| `KUBE_PROM_HELM_RELEASE_NAME` | Helm release name for kube-prometheus-stack (default **`gbmkps`**). Change only if it collides with an existing Helm release. |
+| `GRAFANA_HELM_FULLNAME` | Grafana subchart `fullnameOverride` (default **`gbmon-grafana`**). Sets Service / ClusterRole name prefix; change if it collides. |
 | `KUBE_PROM_STACK_VERSION` | Optional override for the kube-prometheus-stack Helm chart version. |
 | `BLACKBOX_EXPORTER_VERSION` | Optional override for the blackbox-exporter Helm chart version. |
+| `PROMETHEUS_OPERATOR_CRDS_VERSION` | Optional override for the `prometheus-operator-crds` chart (default **13.0.0** → operator **v0.75.x**, aligned with kube-prometheus-stack **61.7.x**). |
+| `KUBECONFIG_PATH` | Optional absolute path to your kubeconfig if `kubectl` works but the default path is wrong. |
 
 Do **not** commit `.env` (it is listed in `.gitignore`).
 
@@ -43,6 +99,7 @@ Do **not** commit `.env` (it is listed in `.gitignore`).
 | --- | --- |
 | `isMinikube` | Same meaning as `IS_MINIKUBE` when the env var is unset. |
 | `grafanaAdminPassword` | Same meaning as `GRAFANA_ADMIN_PASSWORD` when the env var is unset. |
+| `kubeconfigPath` | Same meaning as `KUBECONFIG_PATH` when the env var is unset (absolute path to kubeconfig). |
 
 Examples:
 
@@ -91,12 +148,12 @@ After `pulumi up`:
   - **Minikube:** Prefer the printed helper, or run:
 
     ```bash
-    minikube service guestbook-grafana -n monitoring --url
+    minikube service gbmon-grafana -n monitoring --url
     ```
 
-    The `grafanaUrl` output includes a `127.0.0.1:<nodePort>` hint; the minikube command resolves the correct node address.
+    With **Minikube**, Grafana uses a **fixed NodePort** (default **31302**, overridable via **`GRAFANA_NODE_PORT`** in `.env`) so `pulumi preview` does not need the Service to exist yet. The `grafanaUrl` output shows `127.0.0.1:<port>`; `minikube service …` resolves the correct node address.
 
-  - **LoadBalancer:** open the `http://` URL from `grafanaUrl` once the cloud provider assigns an address.
+  - **LoadBalancer:** `grafanaUrl` is a short hint; run `kubectl get svc gbmon-grafana -n monitoring -o wide` for the external address once the cloud provider assigns it. (Override the Grafana Kubernetes name with **`GRAFANA_HELM_FULLNAME`** in `.env` if needed.)
 
 ### Dashboard
 
@@ -141,8 +198,19 @@ The stack also exports `verifyMetricsHint` with a short reminder.
 
 ## Troubleshooting
 
+- **`kubectl cluster-info` → `localhost:8080` / connection refused:** You have no kubeconfig or no cluster—see **[Local Kubernetes cluster](#local-kubernetes-cluster-fix-localhost8080--connection-refused)** above. Run `npm run diagnose:kubectl`.
+- **“Kubernetes cluster is unreachable” / “no configuration has been provided” (Pulumi):** Same root cause: fix `kubectl cluster-info` first, then set `KUBECONFIG` / `KUBECONFIG_PATH` in `.env` / `kubeconfigPath` in Pulumi config if your config is not at `~/.kube/config`.
 - **Helm fetch timeouts:** ensure outbound HTTPS to `https://prometheus-community.github.io/helm-charts` is allowed.
-- **CRD / ServiceMonitor errors on first deploy:** re-run `pulumi up` once CRDs are fully established.
+- **“no matches for kind ServiceMonitor / PrometheusRule” (CRDs missing):** Monitoring CRDs are installed with **`helm.v3.Release`** for **`prometheus-operator-crds`**, then **`kube-prometheus-stack`** (also a **Release**), so Helm applies CRDs before other manifests. If you previously deployed an older revision that used **`helm.v3.Chart`**, the first `pulumi up` after pulling this change may replace a large set of resources; if the plan looks wrong or stuck, run **`pulumi destroy`** once, then **`pulumi up`**. If you change `KUBE_PROM_STACK_VERSION`, bump **`PROMETHEUS_OPERATOR_CRDS_VERSION`** to match that chart’s `appVersion` (Prometheus Operator release).
+- **Helm: `exists and cannot be imported ... missing key "meta.helm.sh/release-name"`** (often on **`ServiceAccount`**, **`ClusterRole`**, etc.): Leftovers from the old **Pulumi `Chart`** are not owned by Helm. **ClusterRoles** survive `kubectl delete namespace monitoring`, so you must clean them too. This repo uses a **new Helm release name** (`gbmkps` by default) and Grafana **`fullnameOverride`** (`gbmon-grafana` by default) to avoid colliding with old `kps` / `guestbook-grafana-*` names on fresh installs. **If you still have old objects**, run the reset script (it deletes legacy `guestbook-grafana*` / `kps-kube-prometheus-stack*` **ClusterRole**s and webhooks, then the namespace):
+
+  ```bash
+  npm run fix:monitoring-ns   # interactive; or: RESET_MONITORING_CONFIRM=YES npm run fix:monitoring-ns
+  pulumi refresh --yes
+  pulumi up
+  ```
+
+  Alternatively run **`pulumi destroy`** (removes Guestbook too) and **`pulumi up`** for a full clean slate.
 - **Blackbox target down:** ensure the `frontend` Service exists in `default` and returns HTTP 2xx on `/`.
 - **Grafana dashboard empty:** confirm the Prometheus datasource UID in Grafana is `prometheus` (default for this stack). If your stack uses a different UID, edit [dashboards/guestbook.json](dashboards/guestbook.json) datasource blocks.
 

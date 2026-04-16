@@ -14,7 +14,8 @@ kubectl cluster-info &>/dev/null || bad "kubectl cannot reach a cluster"
 
 kubectl get ns monitoring &>/dev/null || bad "namespace monitoring not found — run pulumi up"
 
-kubectl get svc -n monitoring guestbook-grafana &>/dev/null || bad "Grafana service guestbook-grafana not found in monitoring"
+GRAFANA_SVC="${GRAFANA_SVC:-gbmon-grafana}"
+kubectl get svc -n monitoring "${GRAFANA_SVC}" &>/dev/null || bad "Grafana service ${GRAFANA_SVC} not found in monitoring (set GRAFANA_SVC if you overrode GRAFANA_HELM_FULLNAME)"
 
 kubectl get pods -n monitoring -l app.kubernetes.io/name=grafana --no-headers 2>/dev/null | grep -q Running || \
   bad "Grafana pod not Running in monitoring"
@@ -29,7 +30,8 @@ kubectl get servicemonitor -n default redis-replica-exporter &>/dev/null || \
 
 # Prometheus operator-managed Prometheus Service (common names across chart versions)
 PROM_SVC=""
-for name in prometheus-operated prometheus-kps-kube-prometheus-prometheus kps-kube-prometheus-prometheus; do
+for name in prometheus-operated prometheus-kps-kube-prometheus-prometheus kps-kube-prometheus-prometheus \
+  gbmkps-kube-prometheus-stack-prometheus; do
   if kubectl get svc -n monitoring "$name" &>/dev/null; then
     PROM_SVC="$name"
     break

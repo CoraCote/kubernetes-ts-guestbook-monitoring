@@ -9,3 +9,5 @@ template:
     grafanaAdminPassword:
       description: Grafana admin password (stored as a Pulumi secret)
       secret: true
+    kubeconfigPath:
+      description: Optional absolute path to kubeconfig if not using KUBECONFIG or ~/.kube/config

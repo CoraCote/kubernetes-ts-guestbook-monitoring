@@ -1,0 +1,11 @@
+name: guestbook-monitoring
+runtime: nodejs
+description: Kubernetes Guestbook with Prometheus, Grafana, and application metrics
+template:
+  config:
+    isMinikube:
+      description: Whether you are deploying to minikube (uses NodePort for Grafana when true)
+      default: true
+    grafanaAdminPassword:
+      description: Grafana admin password (stored as a Pulumi secret)
+      secret: true

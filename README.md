@@ -16,10 +16,33 @@ This project extends the [Pulumi Kubernetes Guestbook](https://github.com/pulumi
 
 ## Configuration
 
+### Environment file (`.env`)
+
+The program loads [dotenv](https://github.com/motdotla/dotenv) from a **`.env`** file next to **`Pulumi.yaml`** (the project root is found by walking up from the current working directory). Variables in **`.env`** override Pulumi stack config for the same settings when you run `pulumi preview` / `pulumi up` (already-exported `process.env` values still win over the file).
+
+1. Copy the example file and edit values:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Common variables:
+
+| Variable | Description |
+| --- | --- |
+| `IS_MINIKUBE` | `true` / `1` / `yes`: Guestbook frontend stays `ClusterIP`; Grafana uses **NodePort**. `false`: frontend **LoadBalancer** where supported; Grafana **LoadBalancer**. |
+| `GRAFANA_ADMIN_PASSWORD` | Grafana `admin` password (stored as a Pulumi secret in state). Prefer a strong value in production. |
+| `KUBE_PROM_STACK_VERSION` | Optional override for the kube-prometheus-stack Helm chart version. |
+| `BLACKBOX_EXPORTER_VERSION` | Optional override for the blackbox-exporter Helm chart version. |
+
+Do **not** commit `.env` (it is listed in `.gitignore`).
+
+### Pulumi stack config (alternative to `.env`)
+
 | Key | Description |
 | --- | --- |
-| `isMinikube` | `true` (default): Guestbook frontend stays `ClusterIP`; Grafana uses **NodePort**. `false`: frontend `LoadBalancer` where supported; Grafana **LoadBalancer**. |
-| `grafanaAdminPassword` | **Recommended:** set a strong secret: `pulumi config set --secret grafanaAdminPassword '<password>'`. If unset, the program defaults to `changeme` (not for production). |
+| `isMinikube` | Same meaning as `IS_MINIKUBE` when the env var is unset. |
+| `grafanaAdminPassword` | Same meaning as `GRAFANA_ADMIN_PASSWORD` when the env var is unset. |
 
 Examples:
 
@@ -34,7 +57,22 @@ pulumi config set --secret grafanaAdminPassword 'YourSecurePassword'
 
 ```bash
 npm install
+cp .env.example .env   # optional: set IS_MINIKUBE and GRAFANA_ADMIN_PASSWORD
 pulumi up
+```
+
+### Automated checks (no cluster)
+
+```bash
+npm test
+```
+
+### After deploy (cluster verification)
+
+With `kubectl` pointed at the same cluster:
+
+```bash
+npm run verify:cluster
 ```
 
 ## Grafana access
@@ -107,6 +145,17 @@ The stack also exports `verifyMetricsHint` with a short reminder.
 - **CRD / ServiceMonitor errors on first deploy:** re-run `pulumi up` once CRDs are fully established.
 - **Blackbox target down:** ensure the `frontend` Service exists in `default` and returns HTTP 2xx on `/`.
 - **Grafana dashboard empty:** confirm the Prometheus datasource UID in Grafana is `prometheus` (default for this stack). If your stack uses a different UID, edit [dashboards/guestbook.json](dashboards/guestbook.json) datasource blocks.
+
+## Submission checklist (assignment)
+
+- [x] Pulumi deploys **Prometheus** and **Grafana** (kube-prometheus-stack Helm chart).
+- [x] Guestbook **frontend** observed via **Blackbox** HTTP probes; **backend (Redis)** via **redis_exporter** + **ServiceMonitor** resources.
+- [x] Simple metrics: probe success/duration, Redis clients, frontend pod CPU (cAdvisor).
+- [x] Grafana exposed as **NodePort** (minikube) or **LoadBalancer** (cloud).
+- [x] Stack outputs: **`grafanaUrl`**, **`grafanaAdminUser`**, **`grafanaAdminPasswordOut`** (use `--show-secrets` for the password).
+- [x] Optional Grafana dashboard: **Dashboards → Guestbook overview** (ConfigMap + sidecar).
+- [x] **`.env`** supported for `IS_MINIKUBE`, `GRAFANA_ADMIN_PASSWORD`, and optional chart versions.
+- [x] Local test: `npm test`; cluster smoke test: `npm run verify:cluster`.
 
 ## License
 

@@ -5,9 +5,15 @@
     "@types/node": "22.13.14",
     "typescript": "^5.0.0"
   },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node scripts/run-tests.mjs",
+    "verify:cluster": "bash scripts/verify-cluster.sh"
+  },
   "dependencies": {
     "@pulumi/kubernetes": "4.28.0",
-    "@pulumi/pulumi": "3.228.0"
+    "@pulumi/pulumi": "3.228.0",
+    "dotenv": "^16.4.5"
   },
   "license": "MIT"
 }

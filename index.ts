@@ -1,14 +1,53 @@
+import { config as loadEnv } from "dotenv";
 import * as fs from "fs";
+import * as path from "path";
 import * as k8s from "@pulumi/kubernetes";
 import * as pulumi from "@pulumi/pulumi";
 
+/** Resolve the folder containing `Pulumi.yaml` by walking up from cwd so `.env` loads even if the shell cwd differs. */
+function findPulumiProjectRoot(): string {
+    let dir = path.resolve(process.cwd());
+    for (let i = 0; i < 10; i++) {
+        if (fs.existsSync(path.join(dir, "Pulumi.yaml"))) {
+            return dir;
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) {
+            break;
+        }
+        dir = parent;
+    }
+    return path.resolve(process.cwd());
+}
+
+const projectRoot = findPulumiProjectRoot();
+// Load `.env` next to Pulumi.yaml. Existing `process.env` entries win over the file (dotenv default).
+loadEnv({ path: path.join(projectRoot, ".env") });
+
+function envBool(key: string, fallback: boolean): boolean {
+    const v = process.env[key];
+    if (v === undefined || v === "") {
+        return fallback;
+    }
+    return /^(1|true|yes|on)$/i.test(v);
+}
+
+function envString(key: string, fallback: string): string {
+    const v = process.env[key];
+    return v !== undefined && v !== "" ? v : fallback;
+}
+
 const config = new pulumi.Config();
-const isMinikube = config.getBoolean("isMinikube") ?? true;
-const grafanaAdminPassword = config.getSecret("grafanaAdminPassword") ?? pulumi.secret("changeme");
+const isMinikube = envBool("IS_MINIKUBE", config.getBoolean("isMinikube") ?? true);
+
+const grafanaPasswordFromEnv = process.env.GRAFANA_ADMIN_PASSWORD;
+const grafanaAdminPassword = grafanaPasswordFromEnv
+    ? pulumi.secret(grafanaPasswordFromEnv)
+    : (config.getSecret("grafanaAdminPassword") ?? pulumi.secret("changeme"));
 
 const prometheusCommunityRepo = "https://prometheus-community.github.io/helm-charts";
-const kubePromStackVersion = "61.7.2";
-const blackboxExporterVersion = "8.17.0";
+const kubePromStackVersion = envString("KUBE_PROM_STACK_VERSION", "61.7.2");
+const blackboxExporterVersion = envString("BLACKBOX_EXPORTER_VERSION", "8.17.0");
 
 const monitoringNamespace = new k8s.core.v1.Namespace("monitoring", {
     metadata: { name: "monitoring" },
@@ -300,7 +339,7 @@ new k8s.apiextensions.CustomResource(
 );
 
 // Provisioned dashboard (sidecar picks up ConfigMaps in the Grafana namespace).
-const dashboardJsonPath = `${process.cwd()}/dashboards/guestbook.json`;
+const dashboardJsonPath = path.join(projectRoot, "dashboards", "guestbook.json");
 const dashboardJson = fs.readFileSync(dashboardJsonPath, "utf8");
 new k8s.core.v1.ConfigMap(
     "guestbook-grafana-dashboard",

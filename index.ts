@@ -203,6 +203,8 @@ const kpsRelease = new k8s.helm.v3.Release(
                         enabled: true,
                         label: "grafana_dashboard",
                         labelValue: "1",
+                        // Discover ConfigMaps in any namespace (matches chart default; avoids merge surprises).
+                        searchNamespace: "ALL",
                     },
                 },
             },
